@@ -10,14 +10,21 @@ import random
 import string
 import tempfile
 import threading
+import pytz
 import sys
 import time
 import uuid
 
 from bisect import insort
-import pytz
+from importlib import reload
+from moto.core import (
+    ACCOUNT_ID,
+    BaseBackend,
+    BaseModel,
+    CloudFormationModel,
+    CloudWatchMetricProvider,
+)
 
-from moto.core import ACCOUNT_ID, BaseBackend, BaseModel, CloudFormationModel
 from moto.core.utils import (
     iso_8601_datetime_without_milliseconds_s3,
     rfc_1123_datetime,
@@ -1314,11 +1321,37 @@ class FakeBucket(CloudFormationModel):
         return now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-class S3Backend(BaseBackend):
+class S3Backend(BaseBackend, CloudWatchMetricProvider):
+    """
+    Moto implementation for S3.
+
+    Custom S3 endpoints are supported, if you are using a S3-compatible storage solution like Ceph.
+    Example usage:
+
+    .. sourcecode:: python
+
+        os.environ["MOTO_S3_CUSTOM_ENDPOINTS"] = "http://custom.internal.endpoint,http://custom.other.endpoint"
+        @mock_s3
+        def test_my_custom_endpoint():
+            boto3.client("s3", endpoint_url="http://custom.internal.endpoint")
+            ...
+
+    Note that this only works if the environment variable is set **before** the mock is initialized.
+    """
+
     def __init__(self):
         self.buckets = {}
         self.account_public_access_block = None
         self.tagger = TaggingService()
+
+    @property
+    def _url_module(self):
+        # The urls-property can be different depending on env variables
+        # Force a reload, to retrieve the correct set of URLs
+        import moto.s3.urls as backend_urls_module
+
+        reload(backend_urls_module)
+        return backend_urls_module
 
     @staticmethod
     def default_vpc_endpoint_service(service_region, zones):
@@ -1358,9 +1391,10 @@ class S3Backend(BaseBackend):
         # Must provide a method 'get_cloudwatch_metrics' that will return a list of metrics, based on the data available
         # metric_providers["S3"] = self
 
-    def get_cloudwatch_metrics(self):
+    @classmethod
+    def get_cloudwatch_metrics(cls):
         metrics = []
-        for name, bucket in self.buckets.items():
+        for name, bucket in s3_backend.buckets.items():
             metrics.append(
                 MetricDatum(
                     namespace="AWS/S3",
@@ -1370,7 +1404,10 @@ class S3Backend(BaseBackend):
                         {"Name": "StorageType", "Value": "StandardStorage"},
                         {"Name": "BucketName", "Value": name},
                     ],
-                    timestamp=datetime.datetime.now(),
+                    timestamp=datetime.datetime.now(tz=pytz.utc).replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    ),
+                    unit="Bytes",
                 )
             )
             metrics.append(
@@ -1382,7 +1419,10 @@ class S3Backend(BaseBackend):
                         {"Name": "StorageType", "Value": "AllStorageTypes"},
                         {"Name": "BucketName", "Value": name},
                     ],
-                    timestamp=datetime.datetime.now(),
+                    timestamp=datetime.datetime.now(tz=pytz.utc).replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    ),
+                    unit="Count",
                 )
             )
         return metrics
@@ -1595,7 +1635,7 @@ class S3Backend(BaseBackend):
             storage=storage,
             etag=etag,
             is_versioned=bucket.is_versioned,
-            version_id=str(uuid.uuid4()) if bucket.is_versioned else None,
+            version_id=str(uuid.uuid4()) if bucket.is_versioned else "null",
             multipart=multipart,
             encryption=encryption,
             kms_key_id=kms_key_id,
@@ -2008,6 +2048,8 @@ class S3Backend(BaseBackend):
         storage=None,
         acl=None,
         src_version_id=None,
+        encryption=None,
+        kms_key_id=None
     ):
         key = self.get_object(src_bucket_name, src_key_name, version_id=src_version_id)
 
@@ -2017,8 +2059,8 @@ class S3Backend(BaseBackend):
             value=key.value,
             storage=storage or key.storage_class,
             multipart=key.multipart,
-            encryption=key.encryption,
-            kms_key_id=key.kms_key_id,
+            encryption=encryption or key.encryption,
+            kms_key_id=kms_key_id or key.kms_key_id,
             bucket_key_enabled=key.bucket_key_enabled,
             lock_mode=key.lock_mode,
             lock_legal_status=key.lock_legal_status,

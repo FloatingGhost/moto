@@ -28,7 +28,7 @@ import pytest
 
 import sure  # noqa # pylint: disable=unused-import
 
-from moto import settings, mock_s3, mock_s3_deprecated, mock_config
+from moto import settings, mock_s3, mock_s3_deprecated, mock_config, mock_kms
 import moto.s3.models as s3model
 from moto.core.exceptions import InvalidNextTokenException
 from moto.settings import get_s3_default_key_buffer_size, S3_UPLOAD_PART_MIN_SIZE
@@ -1370,6 +1370,63 @@ def test_delete_keys():
     keys = bucket.get_all_keys()
     keys.should.have.length_of(2)
     keys[0].name.should.equal("file1")
+
+
+@mock_s3
+def test_delete_versioned_objects():
+    s3 = boto3.client("s3", region_name=DEFAULT_REGION_NAME)
+    bucket = "test"
+    key = "test"
+
+    s3.create_bucket(Bucket=bucket)
+
+    s3.put_object(Bucket=bucket, Key=key, Body=b"")
+
+    s3.put_bucket_versioning(
+        Bucket=bucket, VersioningConfiguration={"Status": "Enabled"},
+    )
+
+    objects = s3.list_objects_v2(Bucket=bucket).get("Contents")
+    versions = s3.list_object_versions(Bucket=bucket).get("Versions")
+    delete_markers = s3.list_object_versions(Bucket=bucket).get("DeleteMarkers")
+
+    objects.shouldnt.be.empty
+    versions.shouldnt.be.empty
+    delete_markers.should.be.none
+
+    s3.delete_object(Bucket=bucket, Key=key)
+
+    objects = s3.list_objects_v2(Bucket=bucket).get("Contents")
+    versions = s3.list_object_versions(Bucket=bucket).get("Versions")
+    delete_markers = s3.list_object_versions(Bucket=bucket).get("DeleteMarkers")
+
+    objects.should.be.none
+    versions.shouldnt.be.empty
+    delete_markers.shouldnt.be.empty
+
+    s3.delete_object(
+        Bucket=bucket, Key=key, VersionId=versions[0].get("VersionId"),
+    )
+
+    objects = s3.list_objects_v2(Bucket=bucket).get("Contents")
+    versions = s3.list_object_versions(Bucket=bucket).get("Versions")
+    delete_markers = s3.list_object_versions(Bucket=bucket).get("DeleteMarkers")
+
+    objects.should.be.none
+    versions.should.be.none
+    delete_markers.shouldnt.be.empty
+
+    s3.delete_object(
+        Bucket=bucket, Key=key, VersionId=delete_markers[0].get("VersionId"),
+    )
+
+    objects = s3.list_objects_v2(Bucket=bucket).get("Contents")
+    versions = s3.list_object_versions(Bucket=bucket).get("Versions")
+    delete_markers = s3.list_object_versions(Bucket=bucket).get("DeleteMarkers")
+
+    objects.should.be.none
+    versions.should.be.none
+    delete_markers.should.be.none
 
 
 # Has boto3 equivalent
@@ -3321,7 +3378,7 @@ def test_boto3_head_object_with_versioning():
 
 @mock_s3
 def test_boto3_copy_non_existing_file():
-    s3 = boto3.resource("s3")
+    s3 = boto3.resource("s3", region_name=DEFAULT_REGION_NAME)
     src = "srcbucket"
     target = "target"
     s3.create_bucket(Bucket=src)
@@ -6520,3 +6577,28 @@ def test_request_partial_content_should_contain_all_metadata():
     assert response["LastModified"] == obj.last_modified
     assert response["ContentLength"] == 4
     assert response["ContentRange"] == "bytes {}/{}".format(query_range, len(body))
+
+
+@mock_s3
+@mock_kms
+def test_boto3_copy_object_with_kms_encryption():
+    client = boto3.client("s3", region_name=DEFAULT_REGION_NAME)
+    kms_client = boto3.client("kms", region_name=DEFAULT_REGION_NAME)
+    kms_key = kms_client.create_key()["KeyMetadata"]["KeyId"]
+
+    client.create_bucket(
+        Bucket="blah", CreateBucketConfiguration={"LocationConstraint": "eu-west-1"}
+    )
+
+    client.put_object(Bucket="blah", Key="test1", Body=b"test1")
+
+    client.copy_object(
+        CopySource={"Bucket": "blah", "Key": "test1"},
+        Bucket="blah",
+        Key="test2",
+        SSEKMSKeyId=kms_key,
+        ServerSideEncryption="aws:kms",
+    )
+    result = client.head_object(Bucket="blah", Key="test2")
+    assert result["SSEKMSKeyId"] == kms_key
+    assert result["ServerSideEncryption"] == "aws:kms"

@@ -17,11 +17,11 @@ from urllib.parse import (
 
 import xmltodict
 
+from moto import settings
 from moto.packages.httpretty.core import HTTPrettyRequest
 from moto.core.responses import _TemplateEnvironmentMixin, ActionAuthenticatorMixin
 from moto.core.utils import path_url
 from moto.core import ACCOUNT_ID
-from moto.settings import S3_IGNORE_SUBDOMAIN_BUCKETNAME
 
 from moto.s3bucket_path.utils import (
     bucket_name_from_url as bucketpath_bucket_name_from_url,
@@ -188,11 +188,20 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
         return template.render(buckets=all_buckets)
 
     def subdomain_based_buckets(self, request):
-        if S3_IGNORE_SUBDOMAIN_BUCKETNAME:
+        if settings.S3_IGNORE_SUBDOMAIN_BUCKETNAME:
             return False
         host = request.headers.get("host", request.headers.get("Host"))
         if not host:
             host = urlparse(request.url).netloc
+
+        custom_endpoints = settings.get_s3_custom_endpoints()
+        if (
+            host
+            and custom_endpoints
+            and any([host in endpoint for endpoint in custom_endpoints])
+        ):
+            # Default to path-based buckets for S3-compatible SDKs (Ceph, DigitalOcean Spaces, etc)
+            return False
 
         if (
             not host
@@ -1550,6 +1559,8 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
                     storage=storage_class,
                     acl=acl,
                     src_version_id=src_version_id,
+                    kms_key_id=kms_key_id,
+                    encryption=encryption
                 )
             else:
                 raise MissingKey(key=src_key)
